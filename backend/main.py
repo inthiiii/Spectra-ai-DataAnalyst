@@ -1,6 +1,8 @@
 import os
 import shutil
 import re
+import json
+from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -11,13 +13,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# PATH CONFIG
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -25,56 +26,80 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 class QueryRequest(BaseModel):
     query: str
 
+class AnalysisResponse(BaseModel):
+    response: str
+    chart_data: List[str] # Now a LIST of JSON strings
+    chart_type: Optional[str]
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
         file_path = os.path.join(UPLOAD_DIR, "dataset.csv")
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        print(f"✅ File saved at: {file_path}")
         return {"message": "File uploaded successfully", "path": file_path}
     except Exception as e:
-        print(f"❌ Upload failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/analyze")
+@app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_data(request: QueryRequest):
-    # 1. Run the Agent
     inputs = {
         "messages": [HumanMessage(content=request.query)],
         "csv_file_path": os.path.join(UPLOAD_DIR, "dataset.csv") 
     }
     
     final_state = app_graph.invoke(inputs)
-    
-    # 2. Extract Response Text
     last_message = final_state["messages"][-1]
     final_text = last_message.content
     
-    # 3. ROBUST CHART EXTRACTION
-    # We look for the chart in the TOOL history, not just the final text.
-    chart_data = None
+    # --- MULTI-CHART EXTRACTION LOGIC ---
+    charts = []
+    chart_type = None # 'plotly' or 'png'
+
+    # Helper to find ALL charts in text
+    def extract_charts(text):
+        found_charts = []
+        c_type = None
+        
+        # 1. Find ALL Plotly JSONs
+        plotly_matches = re.findall(r'PLOTLY_JSON_START(.*?)PLOTLY_JSON_END', text, re.DOTALL)
+        if plotly_matches:
+            found_charts.extend(plotly_matches)
+            c_type = 'plotly'
+        
+        # 2. Find ALL PNGs (Fallback)
+        # Note: Usually we stick to one type, but let's grab PNGs if no plotly found
+        if not found_charts:
+            png_matches = re.findall(r'!\[CHART_GENERATED\]\((data:image/.*?;base64,.*?)\)', text, re.DOTALL)
+            if png_matches:
+                found_charts.extend(png_matches)
+                c_type = 'png'
+                
+        return found_charts, c_type
+
+    # 1. Check final response
+    charts, chart_type = extract_charts(final_text)
     
-    # First, check if the LLM put it in the final text
-    match = re.search(r'!\[CHART_GENERATED\]\((data:image/.*?;base64,.*?)\)', final_text, re.DOTALL)
-    if match:
-        chart_data = match.group(1)
-        # Remove the massive string from the text to keep it clean
-        final_text = final_text.replace(match.group(0), "")
-    
-    # If not in final text, check the Tool history (The "Resurrection" Logic)
-    if not chart_data:
+    # 2. If missing, check Tool History (The Resurrection Logic)
+    if not charts:
         for msg in reversed(final_state["messages"]):
             if isinstance(msg, ToolMessage):
-                match = re.search(r'!\[CHART_GENERATED\]\((data:image/.*?;base64,.*?)\)', msg.content, re.DOTALL)
-                if match:
-                    chart_data = match.group(1)
+                found, c_type = extract_charts(msg.content)
+                if found:
+                    charts.extend(found)
+                    chart_type = c_type
+                    # If we found charts in one message, we can stop, or keep looking for more.
+                    # Let's stop to avoid duplicates if the LLM repeats itself.
                     break
+    
+    # Clean up the text response
+    final_text = re.sub(r'PLOTLY_JSON_START.*?PLOTLY_JSON_END', '', final_text, flags=re.DOTALL)
+    final_text = re.sub(r'!\[CHART_GENERATED\]\(.*?\)', '', final_text, flags=re.DOTALL)
 
-    # 4. Return Structured Data
     return {
         "response": final_text,
-        "chart_data": chart_data  # Send separately!
+        "chart_data": charts, # List of strings
+        "chart_type": chart_type
     }
 
 if __name__ == "__main__":

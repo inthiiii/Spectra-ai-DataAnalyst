@@ -32,7 +32,6 @@ Spectra is a next-generation **AI Data Agent** that bridges the gap between raw 
 ## ⚡️ Quick Start
 
 ### 1. Clone the Repository
-```bash
 git clone [https://github.com/YOUR_USERNAME/spectra-ai.git](https://github.com/YOUR_USERNAME/spectra-ai.git)
 cd spectra-ai
 
